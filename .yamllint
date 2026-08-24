@@ -9,4 +9,3 @@ rules:
     allowed-values:
       - "true"
       - "false"
-
