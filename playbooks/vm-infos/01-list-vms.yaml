@@ -1,0 +1,564 @@
+---
+- name: Selecionar VMs Linux ligadas para coleta SSH
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+
+  pre_tasks:
+    - name: Validar a política definida no inventário do AWX
+      ansible.builtin.assert:
+        that:
+          - vm_inventory_policy is defined
+          - vm_inventory_policy.powered_on_group is defined
+          - vm_inventory_policy.linux_groups is defined
+          - vm_inventory_policy.linux_groups | length > 0
+        fail_msg: >-
+          Configure vm_inventory_policy nas variáveis do inventário,
+          informando powered_on_group e linux_groups.
+
+  tasks:
+    - name: Inicializar relação de hosts Linux
+      ansible.builtin.set_fact:
+        linux_inventory_hosts: []
+
+    - name: Reunir hosts dos grupos Linux configurados
+      ansible.builtin.set_fact:
+        linux_inventory_hosts: >-
+          {{
+            linux_inventory_hosts
+            | union(groups[item] | default([]))
+          }}
+      loop: "{{ vm_inventory_policy.linux_groups }}"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Selecionar hosts Linux que estão ligados
+      ansible.builtin.set_fact:
+        ssh_candidate_hosts: >-
+          {{
+            (
+              groups[vm_inventory_policy.powered_on_group]
+              | default([])
+            )
+            | intersect(linux_inventory_hosts)
+            | unique
+            | sort
+          }}
+
+    - name: Criar grupo temporário para coleta SSH
+      ansible.builtin.add_host:
+        name: "{{ item }}"
+        groups:
+          - vm_ssh_targets
+      loop: "{{ ssh_candidate_hosts }}"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Exibir total de hosts selecionados
+      ansible.builtin.debug:
+        msg: >-
+          {{ ssh_candidate_hosts | length }} hosts Linux ligados
+          foram selecionados para a coleta SSH.
+
+- name: Coletar informações das VMs por SSH
+  hosts: vm_ssh_targets
+  gather_facts: false
+  become: false
+  serial: "{{ ssh_batch_size | default(20) | int }}"
+  any_errors_fatal: false
+
+  vars:
+    ansible_ssh_timeout: "{{ ssh_connect_timeout | default(10) | int }}"
+
+  tasks:
+    - name: Inicializar resultado da coleta do host
+      ansible.builtin.set_fact:
+        vm_machine_id: >-
+          {{
+            lookup(
+              'ansible.builtin.vars',
+              'config.name',
+              default=inventory_hostname
+            )
+          }}
+        vm_collected_fqdn: "(a verificar)"
+        vm_collected_os: "(a verificar)"
+        vm_collected_version: "(a verificar)"
+        vm_ad_integration: "(a verificar)"
+        vm_privilege_source: "(a verificar)"
+        vm_ssh_status: nao_testado
+        vm_ssh_error: ""
+
+    - name: Testar conexão SSH sem exigir Python remoto
+      ansible.builtin.raw: /bin/true
+      register: ssh_probe
+      changed_when: false
+      failed_when: false
+      ignore_unreachable: true
+
+    - name: Registrar resultado do teste SSH
+      ansible.builtin.set_fact:
+        vm_ssh_status: >-
+          {% set message = ssh_probe.msg | default('') | lower %}
+          {% if ssh_probe.unreachable | default(false) %}
+            {% if 'permission denied' in message
+                  or 'authentication' in message %}
+          falha_autenticacao
+            {% elif 'timed out' in message or 'timeout' in message %}
+          timeout
+            {% elif 'no route to host' in message
+                  or 'name or service not known' in message
+                  or 'connection refused' in message %}
+          host_inacessivel
+            {% elif 'no matching' in message
+                  or 'key exchange' in message %}
+          incompatibilidade_ssh
+            {% else %}
+          erro_ssh
+            {% endif %}
+          {% elif ssh_probe.rc | default(1) != 0 %}
+          erro_ssh
+          {% else %}
+          sucesso
+          {% endif %}
+        vm_ssh_error: >-
+          {{
+            ssh_probe.msg
+            | default(ssh_probe.stderr | default(''))
+            | regex_replace('[\r\n;]+', ' ')
+            | trim
+          }}
+
+    - name: Coletar FQDN, sistema operacional e versão
+      ansible.builtin.raw: |
+        fqdn="$(hostname -f 2>/dev/null || hostname 2>/dev/null || true)"
+        printf 'COLLECT_FQDN=%s\n' "$fqdn"
+
+        if [ -r /etc/os-release ]; then
+          . /etc/os-release
+          printf 'COLLECT_OS=%s\n' "${NAME:-${ID:-desconhecido}}"
+          printf 'COLLECT_VERSION=%s\n' \
+            "${VERSION_ID:-${VERSION:-desconhecida}}"
+        elif command -v lsb_release >/dev/null 2>&1; then
+          printf 'COLLECT_OS=%s\n' \
+            "$(lsb_release -si 2>/dev/null || true)"
+          printf 'COLLECT_VERSION=%s\n' \
+            "$(lsb_release -sr 2>/dev/null || true)"
+        elif [ -r /etc/redhat-release ]; then
+          printf 'COLLECT_OS=%s\n' "$(cat /etc/redhat-release)"
+          printf 'COLLECT_VERSION=%s\n' '(a verificar)'
+        else
+          printf 'COLLECT_OS=%s\n' "$(uname -s 2>/dev/null || true)"
+          printf 'COLLECT_VERSION=%s\n' \
+            "$(uname -r 2>/dev/null || true)"
+        fi
+
+        printf 'COLLECT_USER=%s\n' "$(id -un 2>/dev/null || true)"
+      register: basic_probe
+      changed_when: false
+      failed_when: false
+      ignore_unreachable: true
+      when: vm_ssh_status | trim == "sucesso"
+
+    - name: Separar informações básicas coletadas
+      ansible.builtin.set_fact:
+        collected_fqdn_values: >-
+          {{
+            basic_probe.stdout
+            | default('')
+            | regex_findall('(?m)^COLLECT_FQDN=(.*)$')
+          }}
+        collected_os_values: >-
+          {{
+            basic_probe.stdout
+            | default('')
+            | regex_findall('(?m)^COLLECT_OS=(.*)$')
+          }}
+        collected_version_values: >-
+          {{
+            basic_probe.stdout
+            | default('')
+            | regex_findall('(?m)^COLLECT_VERSION=(.*)$')
+          }}
+        collected_user_values: >-
+          {{
+            basic_probe.stdout
+            | default('')
+            | regex_findall('(?m)^COLLECT_USER=(.*)$')
+          }}
+      when: vm_ssh_status | trim == "sucesso"
+
+    - name: Registrar informações básicas da VM
+      ansible.builtin.set_fact:
+        vm_collected_fqdn: >-
+          {{ collected_fqdn_values | first | default('(a verificar)', true) }}
+        vm_collected_os: >-
+          {{ collected_os_values | first | default('(a verificar)', true) }}
+        vm_collected_version: >-
+          {{
+            collected_version_values
+            | first
+            | default('(a verificar)', true)
+          }}
+        vm_login_user: >-
+          {{ collected_user_values | first | default('', true) }}
+      when: vm_ssh_status | trim == "sucesso"
+
+    - name: Procurar indícios públicos de integração com AD
+      ansible.builtin.raw: |
+        if command -v realm >/dev/null 2>&1; then
+          realm list 2>/dev/null || true
+        fi
+
+        if command -v sssctl >/dev/null 2>&1; then
+          sssctl domain-list 2>/dev/null || true
+        fi
+
+        if command -v net >/dev/null 2>&1; then
+          net ads testjoin 2>/dev/null || true
+        fi
+      register: ad_public_probe
+      changed_when: false
+      failed_when: false
+      ignore_unreachable: true
+      when: vm_ssh_status | trim == "sucesso"
+
+    - name: Inspecionar configurações protegidas de AD e sudo
+      ansible.builtin.raw: |
+        target_user={{ vm_login_user | quote }}
+
+        printf '%s\n' 'AD_CONFIG_BEGIN'
+        grep -Ehi \
+          '^[[:space:]]*(id_provider|ad_domain|sudo_provider)' \
+          /etc/sssd/sssd.conf 2>/dev/null || true
+        grep -Ehi \
+          '^[[:space:]]*(security|realm)[[:space:]]*=' \
+          /etc/samba/smb.conf 2>/dev/null || true
+
+        if [ -d /opt/pbis ]; then
+          printf '%s\n' 'provider=pbis'
+        fi
+
+        if [ -d /opt/centrify ]; then
+          printf '%s\n' 'provider=centrify'
+        fi
+        printf '%s\n' 'AD_CONFIG_END'
+
+        privilege_source='(a verificar)'
+        user_groups="$(id -Gn "$target_user" 2>/dev/null || true)"
+        sudo_access="$(sudo -l -U "$target_user" 2>/dev/null || true)"
+
+        if [ "$target_user" = 'root' ]; then
+          privilege_source='root'
+        elif grep -Eqi \
+          '^[[:space:]]*sudo_provider[[:space:]]*=[[:space:]]*(ad|ldap)' \
+          /etc/sssd/sssd.conf 2>/dev/null; then
+          privilege_source='SSSD sudo'
+        elif awk -v user="$target_user" \
+          '$1 == user { found = 1 } END { exit !found }' \
+          /etc/sudoers /etc/sudoers.d/* 2>/dev/null; then
+          privilege_source='regra direta no sudoers'
+        elif printf '%s\n' "$user_groups" \
+          | tr ' ' '\n' | grep -qx 'sudo'; then
+          privilege_source='grupo local sudo'
+        elif printf '%s\n' "$user_groups" \
+          | tr ' ' '\n' | grep -qx 'wheel'; then
+          privilege_source='grupo local wheel'
+        elif printf '%s\n' "$sudo_access" \
+          | grep -qi 'may run the following commands'; then
+          privilege_source='grupo AD (a confirmar)'
+        elif printf '%s\n' "$sudo_access" \
+          | grep -qi 'not allowed to run sudo'; then
+          privilege_source='sem elevacao'
+        fi
+
+        printf 'PRIVILEGE_SOURCE=%s\n' "$privilege_source"
+      become: true
+      register: protected_probe
+      changed_when: false
+      failed_when: false
+      ignore_errors: true
+      ignore_unreachable: true
+      when: vm_ssh_status | trim == "sucesso"
+
+    - name: Consolidar evidências de integração com AD
+      ansible.builtin.set_fact:
+        ad_evidence: >-
+          {{
+            (
+              ad_public_probe.stdout | default('')
+              ~ '\n'
+              ~ protected_probe.stdout | default('')
+            )
+            | lower
+          }}
+        privilege_source_values: >-
+          {{
+            protected_probe.stdout
+            | default('')
+            | regex_findall('(?m)^PRIVILEGE_SOURCE=(.*)$')
+          }}
+      when: vm_ssh_status | trim == "sucesso"
+
+    - name: Classificar integração com AD e origem da elevação
+      ansible.builtin.set_fact:
+        vm_ad_integration: >-
+          {% if 'active-directory' in ad_evidence
+                or 'id_provider = ad' in ad_evidence
+                or 'id_provider=ad' in ad_evidence
+                or 'security = ads' in ad_evidence
+                or 'security=ads' in ad_evidence
+                or 'join is ok' in ad_evidence
+                or 'provider=pbis' in ad_evidence
+                or 'provider=centrify' in ad_evidence %}
+          Sim
+          {% elif protected_probe.rc | default(1) == 0 %}
+          Não
+          {% else %}
+          (a verificar)
+          {% endif %}
+        vm_privilege_source: >-
+          {{
+            privilege_source_values
+            | first
+            | default('(a verificar)', true)
+          }}
+      when: vm_ssh_status | trim == "sucesso"
+
+- name: Gerar relatórios CSV da coleta SSH
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+
+  vars:
+    report_batch_size: "{{ csv_batch_size | default(200) | int }}"
+    information_filename: >-
+      vm_system_info_{{ tower_job_id | default('manual') }}.csv
+    error_filename: >-
+      vm_ssh_errors_{{ tower_job_id | default('manual') }}.csv
+
+  tasks:
+    - name: Criar diretório temporário dos relatórios
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: awx_vm_ssh_inventory_
+      register: report_workspace
+
+    - name: Inicializar relação de hosts com falha SSH
+      ansible.builtin.set_fact:
+        failed_ssh_hosts: []
+
+    - name: Reunir hosts com falha SSH
+      ansible.builtin.set_fact:
+        failed_ssh_hosts: "{{ failed_ssh_hosts + [item] }}"
+      loop: "{{ groups['vm_ssh_targets'] | default([]) }}"
+      loop_control:
+        label: "{{ item }}"
+      when: >-
+        hostvars[item].vm_ssh_status
+        | default('erro_ssh')
+        | trim
+        != 'sucesso'
+
+    - name: Criar diretórios para os fragmentos CSV
+      ansible.builtin.file:
+        path: "{{ report_workspace.path }}/{{ item }}"
+        state: directory
+        mode: "0700"
+      loop:
+        - information
+        - errors
+
+    - name: Criar cabeçalho do relatório de informações
+      ansible.builtin.copy:
+        dest: >-
+          {{ report_workspace.path }}/information/00000-header.csv
+        mode: "0600"
+        content: |
+          "id_da_maquina";"fqdn";"sistema_operacional";"versao";"integracao_ad";"origem_elevacao"
+
+    - name: Criar cabeçalho do relatório de falhas
+      ansible.builtin.copy:
+        dest: "{{ report_workspace.path }}/errors/00000-header.csv"
+        mode: "0600"
+        content: |
+          "id_da_maquina";"hostname_inventario";"ip";"status_ssh";"erro_ssh"
+
+    - name: Gerar fragmentos do relatório de informações
+      ansible.builtin.copy:
+        dest: >-
+          {{ report_workspace.path }}/information/10000-{{
+            "%05d" | format(batch_index)
+          }}.csv
+        mode: "0600"
+        content: |
+          {% for vm_hostname in item -%}
+          {% set vm_data = hostvars[vm_hostname] -%}
+          {% set machine_id_csv = (
+            vm_data.vm_machine_id
+            | default(vm_hostname)
+            | string
+            | replace('"', '""')
+          ) -%}
+          {% set fqdn_csv = (
+            vm_data.vm_collected_fqdn
+            | default('(a verificar)')
+            | trim
+            | replace('"', '""')
+          ) -%}
+          {% set os_csv = (
+            vm_data.vm_collected_os
+            | default('(a verificar)')
+            | trim
+            | replace('"', '""')
+          ) -%}
+          {% set version_csv = (
+            vm_data.vm_collected_version
+            | default('(a verificar)')
+            | trim
+            | replace('"', '""')
+          ) -%}
+          {% set ad_csv = (
+            vm_data.vm_ad_integration
+            | default('(a verificar)')
+            | trim
+            | replace('"', '""')
+          ) -%}
+          {% set privilege_csv = (
+            vm_data.vm_privilege_source
+            | default('(a verificar)')
+            | trim
+            | replace('"', '""')
+          ) -%}
+          {{
+            '"' ~ machine_id_csv
+            ~ '";"' ~ fqdn_csv
+            ~ '";"' ~ os_csv
+            ~ '";"' ~ version_csv
+            ~ '";"' ~ ad_csv
+            ~ '";"' ~ privilege_csv
+            ~ '"'
+          }}
+          {% endfor %}
+      loop: >-
+        {{
+          groups['vm_ssh_targets']
+          | default([])
+          | batch(report_batch_size | int)
+          | list
+        }}
+      loop_control:
+        index_var: batch_index
+        label: "Lote {{ batch_index + 1 }}"
+
+    - name: Gerar fragmentos do relatório de falhas SSH
+      ansible.builtin.copy:
+        dest: >-
+          {{ report_workspace.path }}/errors/10000-{{
+            "%05d" | format(batch_index)
+          }}.csv
+        mode: "0600"
+        content: |
+          {% for vm_hostname in item -%}
+          {% set vm_data = hostvars[vm_hostname] -%}
+          {% set ssh_status = vm_data.vm_ssh_status | default('erro_ssh') | trim -%}
+          {% if ssh_status != 'sucesso' -%}
+          {% set vm_ip = vm_data.ansible_host | default('') -%}
+          {% set machine_id_csv = (
+            vm_data.vm_machine_id
+            | default(vm_hostname)
+            | string
+            | replace('"', '""')
+          ) -%}
+          {% set hostname_csv = vm_hostname | replace('"', '""') -%}
+          {% set ip_csv = vm_ip | string | replace('"', '""') -%}
+          {% set status_csv = ssh_status | replace('"', '""') -%}
+          {% set error_csv = (
+            vm_data.vm_ssh_error
+            | default('')
+            | replace('"', '""')
+          ) -%}
+          {{
+            '"' ~ machine_id_csv
+            ~ '";"' ~ hostname_csv
+            ~ '";"' ~ ip_csv
+            ~ '";"' ~ status_csv
+            ~ '";"' ~ error_csv
+            ~ '"'
+          }}
+          {% endif -%}
+          {% endfor %}
+      loop: >-
+        {{
+          failed_ssh_hosts
+          | batch(report_batch_size | int)
+          | list
+        }}
+      loop_control:
+        index_var: batch_index
+        label: "Lote {{ batch_index + 1 }}"
+
+    - name: Montar relatório final de informações
+      ansible.builtin.assemble:
+        src: "{{ report_workspace.path }}/information"
+        dest: "{{ report_workspace.path }}/{{ information_filename }}"
+        mode: "0600"
+
+    - name: Montar relatório final de falhas SSH
+      ansible.builtin.assemble:
+        src: "{{ report_workspace.path }}/errors"
+        dest: "{{ report_workspace.path }}/{{ error_filename }}"
+        mode: "0600"
+
+    - name: Marcar início do relatório de informações
+      ansible.builtin.debug:
+        msg: VM_SYSTEM_INFO_CSV_BEGIN
+
+    - name: Exibir relatório de informações no output do AWX
+      ansible.builtin.command:
+        argv:
+          - cat
+          - "{{ report_workspace.path }}/{{ information_filename }}"
+      changed_when: false
+
+    - name: Marcar fim do relatório de informações
+      ansible.builtin.debug:
+        msg: VM_SYSTEM_INFO_CSV_END
+
+    - name: Marcar início do relatório de falhas SSH
+      ansible.builtin.debug:
+        msg: VM_SSH_ERRORS_CSV_BEGIN
+
+    - name: Exibir relatório de falhas SSH no output do AWX
+      ansible.builtin.command:
+        argv:
+          - cat
+          - "{{ report_workspace.path }}/{{ error_filename }}"
+      changed_when: false
+
+    - name: Marcar fim do relatório de falhas SSH
+      ansible.builtin.debug:
+        msg: VM_SSH_ERRORS_CSV_END
+
+    - name: Publicar resumo da coleta
+      ansible.builtin.set_stats:
+        data:
+          ssh_target_count: >-
+            {{ groups['vm_ssh_targets'] | default([]) | length }}
+          ssh_batch_size: "{{ ssh_batch_size | default(20) | int }}"
+          information_csv_filename: "{{ information_filename }}"
+          error_csv_filename: "{{ error_filename }}"
+        per_host: false
+
+    - name: Exibir resumo dos relatórios
+      ansible.builtin.debug:
+        msg:
+          - >-
+            Hosts processados:
+            {{ groups['vm_ssh_targets'] | default([]) | length }}
+          - "Informações: {{ information_filename }}"
+          - "Falhas SSH: {{ error_filename }}"
+          - >-
+            Copie os conteúdos exibidos entre os marcadores CSV_BEGIN e CSV_END.
