@@ -81,12 +81,36 @@
         content: |
           {% for vm_hostname in item -%}
           {% set vm_data = hostvars[vm_hostname] -%}
-          {% set vm_ip = vm_data['guest.ipAddress'] | default(vm_data.ansible_host | default('')) -%}
+          {% set vm_ip = (
+            vm_data['guest.ipAddress']
+            | default(vm_data.ansible_host | default(''))
+          ) -%}
           {% set is_template = vm_data['config.template'] | default(false) | bool -%}
-          {% set exclude_templates = vm_inventory_policy.exclude_templates | default(true) | bool -%}
+          {% set exclude_templates = (
+            vm_inventory_policy.exclude_templates
+            | default(true)
+            | bool
+          ) -%}
           {% set require_ip = vm_inventory_policy.require_ip | default(true) | bool -%}
-          {% if (not exclude_templates or not is_template) and (not require_ip or vm_ip | length > 0) -%}
-          "{{ vm_data['config.name'] | default(vm_hostname) | string | replace('"', '""') }}";"{{ vm_data['guest.hostName'] | default('') | string | replace('"', '""') }}";"{{ vm_ip | string | replace('"', '""') }}"
+          {% set vm_id_csv = (
+            vm_data['config.name']
+            | default(vm_hostname)
+            | string
+            | replace('"', '""')
+          ) -%}
+          {% set hostname_csv = (
+            vm_data['guest.hostName']
+            | default('')
+            | string
+            | replace('"', '""')
+          ) -%}
+          {% set vm_ip_csv = vm_ip | string | replace('"', '""') -%}
+          {% if (
+            not exclude_templates or not is_template
+          ) and (
+            not require_ip or vm_ip | length > 0
+          ) -%}
+          "{{ vm_id_csv }}";"{{ hostname_csv }}";"{{ vm_ip_csv }}"
           {% endif -%}
           {% endfor %}
       loop: "{{ candidate_hosts | batch(report_batch_size | int) | list }}"
