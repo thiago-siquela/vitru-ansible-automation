@@ -1,0 +1,9 @@
+---
+profile: production
+
+exclude_paths:
+  - .ansible/
+  - .cache/
+
+skip_list:
+  - run-once[task]

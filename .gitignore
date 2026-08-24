@@ -1,0 +1,10 @@
+.ansible/
+.cache/
+*.retry
+*.log
+.env
+.env.*
+artifacts/
+reports/
+secrets/
+
