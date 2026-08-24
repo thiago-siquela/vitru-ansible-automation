@@ -69,7 +69,7 @@
         dest: "{{ report_workspace.path }}/fragments/00000-header.csv"
         mode: "0600"
         content: |
-          "marca";"inventario";"inventory_hostname";"vm_name";"hostname";"ip";"guest_id";"instance_uuid";"grupos_linux"
+          "id_da_maquina";"hostname";"ip"
 
     - name: Gerar fragmentos CSV em lotes
       ansible.builtin.copy:
@@ -81,13 +81,12 @@
         content: |
           {% for vm_hostname in item -%}
           {% set vm_data = hostvars[vm_hostname] -%}
-          {% set vm_groups = vm_data.group_names | default([]) -%}
           {% set vm_ip = vm_data['guest.ipAddress'] | default(vm_data.ansible_host | default('')) -%}
           {% set is_template = vm_data['config.template'] | default(false) | bool -%}
           {% set exclude_templates = vm_inventory_policy.exclude_templates | default(true) | bool -%}
           {% set require_ip = vm_inventory_policy.require_ip | default(true) | bool -%}
           {% if (not exclude_templates or not is_template) and (not require_ip or vm_ip | length > 0) -%}
-          "{{ vm_inventory_policy.brand | default('') | string | replace('"', '""') }}";"{{ awx_inventory_name | default('') | string | replace('"', '""') }}";"{{ vm_hostname | string | replace('"', '""') }}";"{{ vm_data['config.name'] | default('') | string | replace('"', '""') }}";"{{ vm_data['guest.hostName'] | default('') | string | replace('"', '""') }}";"{{ vm_ip | string | replace('"', '""') }}";"{{ vm_data['guest.guestId'] | default(vm_data['config.guestId'] | default('')) | string | replace('"', '""') }}";"{{ vm_data['config.instanceUuid'] | default('') | string | replace('"', '""') }}";"{{ vm_groups | intersect(vm_inventory_policy.linux_groups) | join(',') | replace('"', '""') }}"
+          "{{ vm_data['config.name'] | default(vm_hostname) | string | replace('"', '""') }}";"{{ vm_data['guest.hostName'] | default('') | string | replace('"', '""') }}";"{{ vm_ip | string | replace('"', '""') }}"
           {% endif -%}
           {% endfor %}
       loop: "{{ candidate_hosts | batch(report_batch_size | int) | list }}"

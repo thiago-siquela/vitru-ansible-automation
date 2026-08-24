@@ -33,7 +33,6 @@ Exemplo:
 ```yaml
 ---
 vm_inventory_policy:
-  brand: nome-da-marca
   powered_on_group: poweredOn
   linux_groups:
     - grupo-linux-01
@@ -46,7 +45,6 @@ vm_inventory_policy:
 
 | Variável | Obrigatória | Padrão | Descrição |
 | --- | --- | --- | --- |
-| `vm_inventory_policy.brand` | Não | Vazio | Marca associada ao inventário e gravada na coluna `marca`. |
 | `vm_inventory_policy.powered_on_group` | Sim | — | Grupo que identifica as máquinas ligadas. |
 | `vm_inventory_policy.linux_groups` | Sim | — | Lista de grupos que identificam sistemas Linux. |
 | `vm_inventory_policy.exclude_templates` | Não | `true` | Exclui objetos marcados como template. |
@@ -89,25 +87,43 @@ própria `vm_inventory_policy`.
 O arquivo utiliza ponto e vírgula (`;`) como delimitador e contém apenas uma
 linha de cabeçalho seguida pelas máquinas selecionadas.
 
+Nesta primeira etapa do inventário, o relatório contém somente as informações
+que já estão disponíveis diretamente no inventário dinâmico e são utilizadas
+na planilha: identificação da máquina, hostname e endereço IP. Os demais campos
+da planilha serão preenchidos posteriormente por playbooks e integrações
+específicos.
+
 Cabeçalho gerado:
 
 ```text
-marca;inventario;inventory_hostname;vm_name;hostname;ip;guest_id;instance_uuid;grupos_linux
+id_da_maquina;hostname;ip
 ```
 
 ### Legenda das colunas
 
 | Coluna | Descrição | Origem no inventário |
 | --- | --- | --- |
-| `marca` | Marca associada ao ambiente inventariado. | `vm_inventory_policy.brand` |
-| `inventario` | Nome do inventário utilizado na execução. | `awx_inventory_name` |
-| `inventory_hostname` | Identificador completo do host dentro do inventário do AWX. | Nome do host no inventário |
-| `vm_name` | Nome da máquina virtual. | `config.name` |
+| `id_da_maquina` | Identificação da máquina usada na coluna `ID da máquina` da planilha. Se `config.name` não existir, utiliza o nome do host no inventário. | `config.name` ou nome do host no inventário |
 | `hostname` | Nome de host informado pelo sistema convidado. | `guest.hostName` |
 | `ip` | Endereço IP principal conhecido pelo inventário. | `guest.ipAddress` ou `ansible_host` |
-| `guest_id` | Identificador técnico do sistema operacional convidado. | `guest.guestId` ou `config.guestId` |
-| `instance_uuid` | UUID da instância virtual. | `config.instanceUuid` |
-| `grupos_linux` | Grupos Linux da política aos quais a máquina pertence. | Interseção entre `group_names` e `linux_groups` |
+
+### Campos da planilha fora do escopo deste playbook
+
+Os campos abaixo não são exportados pelo playbook atual:
+
+- Marca;
+- Ambiente;
+- FQDN;
+- Localização/datacenter/cloud;
+- Sistema operacional e versão;
+- Situação da integração com o Active Directory;
+- Origem da elevação de privilégios;
+- Data da coleta.
+
+Essas informações exigem regras organizacionais, coleta dentro do sistema
+operacional ou consulta a outras fontes. Elas devem ser tratadas em playbooks
+ou integrações independentes, evitando misturar responsabilidades nesta
+primeira coleta.
 
 ## Resumo publicado no AWX
 
@@ -163,11 +179,7 @@ ao Execution Environment.
 
 ## Observações
 
-- Se `brand` não estiver configurada, a coluna `marca` será gerada vazia.
 - Se um grupo listado em `linux_groups` não existir, ele será ignorado.
-- O valor de `guest_id` é técnico, por exemplo um identificador fornecido pelo
-  VMware, e pode precisar de normalização antes de ser usado em um inventário
-  executivo.
 - Diminuir `csv_batch_size` reduz o volume processado por fragmento, mas aumenta
   a quantidade de lotes.
 - O filtro `Limit` do Job Template é aplicado antes da lógica do playbook e pode
