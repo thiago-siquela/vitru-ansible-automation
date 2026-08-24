@@ -1,0 +1,164 @@
+---
+- name: Gerar relatório CSV de VMs Linux ligadas
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+
+  vars:
+    report_batch_size: "{{ csv_batch_size | default(200) | int }}"
+    report_filename: >-
+      linux_powered_vms_{{ tower_job_id | default('manual') }}.csv
+
+  pre_tasks:
+    - name: Validar a política definida no inventário do AWX
+      ansible.builtin.assert:
+        that:
+          - vm_inventory_policy is defined
+          - vm_inventory_policy.powered_on_group is defined
+          - vm_inventory_policy.linux_groups is defined
+          - vm_inventory_policy.linux_groups | length > 0
+          - report_batch_size | int > 0
+        fail_msg: >-
+          Configure vm_inventory_policy nas variáveis do inventário
+          e informe um csv_batch_size maior que zero.
+
+  tasks:
+    - name: Criar diretório temporário do relatório
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: awx_vm_inventory_
+      register: report_workspace
+
+    - name: Criar diretório para os fragmentos
+      ansible.builtin.file:
+        path: "{{ report_workspace.path }}/fragments"
+        state: directory
+        mode: "0700"
+
+    - name: Inicializar relação de hosts Linux
+      ansible.builtin.set_fact:
+        linux_inventory_hosts: []
+
+    - name: Reunir hosts dos grupos Linux configurados
+      ansible.builtin.set_fact:
+        linux_inventory_hosts: >-
+          {{
+            linux_inventory_hosts
+            | union(groups[item] | default([]))
+          }}
+      loop: "{{ vm_inventory_policy.linux_groups }}"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Selecionar candidatos Linux que estão ligados
+      ansible.builtin.set_fact:
+        candidate_hosts: >-
+          {{
+            (
+              groups[vm_inventory_policy.powered_on_group]
+              | default([])
+            )
+            | intersect(linux_inventory_hosts)
+            | unique
+            | sort
+          }}
+
+    - name: Criar cabeçalho do CSV
+      ansible.builtin.copy:
+        dest: "{{ report_workspace.path }}/fragments/00000-header.csv"
+        mode: "0600"
+        content: |
+          "marca";"inventario";"inventory_hostname";"vm_name";"hostname";"ip";"guest_id";"instance_uuid";"grupos_linux"
+
+    - name: Gerar fragmentos CSV em lotes
+      ansible.builtin.copy:
+        dest: >-
+          {{ report_workspace.path }}/fragments/10000-{{
+            "%05d" | format(batch_index)
+          }}.csv
+        mode: "0600"
+        content: |
+          {% for vm_hostname in item -%}
+          {% set vm_data = hostvars[vm_hostname] -%}
+          {% set vm_groups = vm_data.group_names | default([]) -%}
+          {% set vm_ip = vm_data['guest.ipAddress'] | default(vm_data.ansible_host | default('')) -%}
+          {% set is_template = vm_data['config.template'] | default(false) | bool -%}
+          {% set exclude_templates = vm_inventory_policy.exclude_templates | default(true) | bool -%}
+          {% set require_ip = vm_inventory_policy.require_ip | default(true) | bool -%}
+          {% if (not exclude_templates or not is_template) and (not require_ip or vm_ip | length > 0) -%}
+          "{{ vm_inventory_policy.brand | default('') | string | replace('"', '""') }}";"{{ awx_inventory_name | default('') | string | replace('"', '""') }}";"{{ vm_hostname | string | replace('"', '""') }}";"{{ vm_data['config.name'] | default('') | string | replace('"', '""') }}";"{{ vm_data['guest.hostName'] | default('') | string | replace('"', '""') }}";"{{ vm_ip | string | replace('"', '""') }}";"{{ vm_data['guest.guestId'] | default(vm_data['config.guestId'] | default('')) | string | replace('"', '""') }}";"{{ vm_data['config.instanceUuid'] | default('') | string | replace('"', '""') }}";"{{ vm_groups | intersect(vm_inventory_policy.linux_groups) | join(',') | replace('"', '""') }}"
+          {% endif -%}
+          {% endfor %}
+      loop: "{{ candidate_hosts | batch(report_batch_size | int) | list }}"
+      loop_control:
+        index_var: batch_index
+        label: >-
+          Lote {{ batch_index + 1 }} —
+          {{ item | length }} candidatos
+
+    - name: Montar o arquivo CSV final
+      ansible.builtin.assemble:
+        src: "{{ report_workspace.path }}/fragments"
+        dest: "{{ report_workspace.path }}/{{ report_filename }}"
+        mode: "0600"
+
+    - name: Contar linhas do CSV
+      ansible.builtin.command:
+        argv:
+          - wc
+          - -l
+          - "{{ report_workspace.path }}/{{ report_filename }}"
+      register: csv_line_count
+      changed_when: false
+
+    - name: Calcular total de VMs exportadas
+      ansible.builtin.set_fact:
+        selected_vm_count: >-
+          {{
+            [
+              (csv_line_count.stdout.split()[0] | int) - 1,
+              0
+            ]
+            | max
+          }}
+
+    - name: Marcar início do conteúdo CSV
+      ansible.builtin.debug:
+        msg: CSV_BEGIN
+
+    - name: Exibir CSV no output do AWX
+      ansible.builtin.command:
+        argv:
+          - cat
+          - "{{ report_workspace.path }}/{{ report_filename }}"
+      changed_when: false
+
+    - name: Marcar fim do conteúdo CSV
+      ansible.builtin.debug:
+        msg: CSV_END
+
+    - name: Publicar somente o resumo do relatório
+      ansible.builtin.set_stats:
+        data:
+          selected_vm_count: "{{ selected_vm_count | int }}"
+          csv_batch_size: "{{ report_batch_size | int }}"
+          csv_batch_count: >-
+            {{
+              (
+                candidate_hosts
+                | batch(report_batch_size | int)
+                | list
+                | length
+              )
+            }}
+          csv_filename: "{{ report_filename }}"
+        per_host: false
+
+    - name: Exibir resumo
+      ansible.builtin.debug:
+        msg:
+          - "VMs exportadas: {{ selected_vm_count }}"
+          - "Tamanho dos lotes: {{ report_batch_size }}"
+          - "Arquivo: {{ report_filename }}"
+          - "Copie o conteúdo localizado entre CSV_BEGIN e CSV_END."
